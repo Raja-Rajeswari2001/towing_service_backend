@@ -1,6 +1,6 @@
 # app/routers/vehicles.py
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException , Query
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from uuid import UUID
@@ -127,7 +127,11 @@ async def search_location(
     address: Optional[str] = None,
     city: Optional[str] = None,
     state: Optional[str] = None,
-    zipcode: Optional[str] = None
+    zipcode: Optional[str] = None,
+    country: Optional[str] = None,  # Added country parameter
+    # Field filtering parameters
+    fields: Optional[str] = Query(None, description="Comma-separated list of fields to return. Options: latitude, longitude, address, landmark, city, state, zipcode, country, formatted_address"),
+    exclude_fields: Optional[str] = Query(None, description="Comma-separated list of fields to exclude from response")
 ):
     """
     Auto-fetch location details using any combination of:
@@ -135,25 +139,50 @@ async def search_location(
     - city
     - state
     - zipcode
+    - country
     
-    Example: 
-    /vehicles/location/search?address=Times Square&city=New York&state=NY
-    /vehicles/location/search?zipcode=10036
+    Examples:
+    - Only city: /vehicles/location/search?city=New York
+    - City and state: /vehicles/location/search?city=Los Angeles&state=CA
+    - Only state: /vehicles/location/search?state=Texas
+    - Only country: /vehicles/location/search?country=United States
+    - Full address: /vehicles/location/search?address=Times Square&city=New York&state=NY
+    
+    Field filtering examples:
+    - Get only latitude and longitude: /vehicles/location/search?zipcode=10036&fields=latitude,longitude
+    - Exclude landmark and country: /vehicles/location/search?zipcode=10036&exclude_fields=landmark,country
     """
     
-    # If zipcode provided, use zipcode search
+    # If zipcode provided, use zipcode search (priority)
     if zipcode:
         result = await search_location_by_zipcode(zipcode)
     else:
-        # Use address search
-        if not address:
-            raise HTTPException(status_code=400, detail="Either address or zipcode is required")
-        result = await search_location_by_address(address, city, state, zipcode)
+        # Build search query from available parameters
+        if not any([address, city, state, country]):
+            raise HTTPException(status_code=400, detail="At least one of address, city, state, or country is required")
+        
+        # If only city and/or state provided, use them as address
+        if not address and (city or state or country):
+            # Build a composite search string
+            search_parts = []
+            if city:
+                search_parts.append(city)
+            if state:
+                search_parts.append(state)
+            if country:
+                search_parts.append(country)
+            
+            search_address = ", ".join(search_parts)
+            result = await search_location_by_address(search_address, city, state, zipcode)
+        else:
+            # Use address search with all parameters
+            result = await search_location_by_address(address, city, state, zipcode)
     
     if not result.get("success"):
         raise HTTPException(status_code=404, detail=result.get("error", "Location not found"))
     
-    return {
+    # Build complete response
+    full_response = {
         "latitude": result.get("latitude"),
         "longitude": result.get("longitude"),
         "address": result.get("address"),
@@ -162,8 +191,24 @@ async def search_location(
         "state": result.get("state"),
         "zipcode": result.get("zipcode"),
         "country": result.get("country"),
-        "formatted_address": f"{result.get('address', '')}"
+        "formatted_address": result.get("address", "")
     }
+    
+    # Apply field filtering
+    if fields:
+        # Include only specified fields
+        field_list = [f.strip() for f in fields.split(",")]
+        filtered_response = {k: v for k, v in full_response.items() if k in field_list}
+        return filtered_response
+    
+    if exclude_fields:
+        # Exclude specified fields
+        exclude_list = [f.strip() for f in exclude_fields.split(",")]
+        filtered_response = {k: v for k, v in full_response.items() if k not in exclude_list}
+        return filtered_response
+    
+    # Return all fields if no filtering specified
+    return full_response
 
 @router.get("/location/from-address")
 async def get_location_from_address(
@@ -417,11 +462,19 @@ async def fetch_vehicle_details_from_vin(vin: str):
 @router.get("/detail/{vin}")
 async def get_vehicle_details_by_vin(
     vin: str,
+    include_fields: Optional[str] = Query(None, description="Comma-separated fields to include: brand, model, year, color, vehicle_type, body_class, manufacturer, full_name"),
+    exclude_fields: Optional[str] = Query(None, description="Comma-separated fields to exclude"),
     db: Session = Depends(get_db)
 ):
     """
     Get vehicle details from VIN (No authentication required)
     Fetches from NHTSA API and returns brand, model, year, etc.
+    
+    Filter examples:
+    - Only brand and model: /detail/5YJSA1E26HF000337?include_fields=brand,model
+    - Exclude color and message: /detail/5YJSA1E26HF000337?exclude_fields=color,message
+    - Only brand: /detail/5YJSA1E26HF000337?include_fields=brand
+    - Brand with model and year: /detail/5YJSA1E26HF000337?include_fields=brand,model,year
     """
     
     # Validate VIN format
@@ -434,8 +487,8 @@ async def get_vehicle_details_by_vin(
     if not api_data.get("success"):
         raise HTTPException(status_code=400, detail=api_data.get("error", "Failed to decode VIN"))
     
-    # Return the decoded information with color as null
-    return {
+    # Build complete response
+    full_response = {
         "vin": vin.upper(),
         "brand": api_data.get("brand"),
         "model": api_data.get("model"),
@@ -447,7 +500,324 @@ async def get_vehicle_details_by_vin(
         "full_name": f"{api_data.get('year')} {api_data.get('brand')} {api_data.get('model')}" if api_data.get('year') else f"{api_data.get('brand')} {api_data.get('model')}",
         "message": "Color information is not available from VIN. Please add manually."
     }
+    
+    # Apply field filtering
+    if include_fields:
+        # Include only specified fields
+        field_list = [f.strip() for f in include_fields.split(",")]
+        filtered_response = {k: v for k, v in full_response.items() if k in field_list}
+        return filtered_response
+    
+    if exclude_fields:
+        # Exclude specified fields
+        exclude_list = [f.strip() for f in exclude_fields.split(",")]
+        filtered_response = {k: v for k, v in full_response.items() if k not in exclude_list}
+        return filtered_response
+    
+    # Return all fields if no filtering specified
+    return full_response
 
+
+@router.get("/brands/list")
+async def get_available_brands(
+    search: Optional[str] = Query(None, description="Search brand by name"),
+    limit: int = Query(50, description="Number of brands to return", ge=1, le=200)
+):
+    """
+    Get list of available vehicle brands from NHTSA database
+    Returns all car brands with their details
+    
+    Examples:
+    - All brands: /brands/list
+    - Search brand: /brands/list?search=toyota
+    - Limit results: /brands/list?limit=10
+    """
+    
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            # Fetch all makes from NHTSA API
+            url = "https://vpic.nhtsa.dot.gov/api/vehicles/getallmakes?format=json"
+            response = await client.get(url)
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get("Results"):
+                brands = []
+                for item in data["Results"]:
+                    brand_name = item.get("Make_Name", "")
+                    brand_id = item.get("Make_ID", "")
+                    
+                    brands.append({
+                        "brand_id": brand_id,
+                        "brand_name": brand_name,
+                        "brand_name_lower": brand_name.lower()
+                    })
+                
+                # Apply search filter if provided
+                if search:
+                    search_lower = search.lower()
+                    brands = [b for b in brands if search_lower in b["brand_name_lower"]]
+                
+                # Remove the lowercase field from response
+                for brand in brands:
+                    del brand["brand_name_lower"]
+                
+                # Apply limit
+                brands = brands[:limit]
+                
+                return {
+                    "total_brands": len(brands),
+                    "brands": brands
+                }
+            
+            return {"total_brands": 0, "brands": []}
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to fetch brands: {str(e)}")
+
+
+@router.get("/brands/{brand_name}/models")
+async def get_models_by_brand(
+    brand_name: str,
+    year: Optional[int] = Query(None, description="Filter models by year"),
+    search: Optional[str] = Query(None, description="Search model by name"),
+    limit: int = Query(50, description="Number of models to return", ge=1, le=200)
+):
+    """
+    Get all models for a specific brand
+    
+    Examples:
+    - All Tesla models: /brands/Tesla/models
+    - Toyota models from 2020: /brands/Toyota/models?year=2020
+    - Search Honda models with 'Civic': /brands/Honda/models?search=civic
+    """
+    
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            # Build URL based on whether year is provided
+            if year:
+                url = f"https://vpic.nhtsa.dot.gov/api/vehicles/getmodelsformakeyear/make/{brand_name}/modelyear/{year}?format=json"
+            else:
+                url = f"https://vpic.nhtsa.dot.gov/api/vehicles/getmodelsformake/{brand_name}?format=json"
+            
+            response = await client.get(url)
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get("Results"):
+                models = []
+                for item in data["Results"]:
+                    model_name = item.get("Model_Name", "")
+                    model_id = item.get("Model_ID", "")
+                    
+                    model_data = {
+                        "model_id": model_id,
+                        "model_name": model_name,
+                        "brand_name": item.get("Make_Name", brand_name)
+                    }
+                    
+                    if year:
+                        model_data["year"] = year
+                    
+                    models.append(model_data)
+                
+                # Apply search filter if provided
+                if search:
+                    search_lower = search.lower()
+                    models = [m for m in models if search_lower in m["model_name"].lower()]
+                
+                # Apply limit
+                models = models[:limit]
+                
+                return {
+                    "brand": brand_name,
+                    "total_models": len(models),
+                    "year": year if year else "All years",
+                    "models": models
+                }
+            
+            return {"brand": brand_name, "total_models": 0, "models": []}
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to fetch models: {str(e)}")
+
+
+@router.get("/brands/{brand_name}/years")
+async def get_years_by_brand(
+    brand_name: str,
+    model_name: Optional[str] = Query(None, description="Filter by specific model")
+):
+    """
+    Get available years for a specific brand or brand-model combination
+    
+    Examples:
+    - All years for Tesla: /brands/Tesla/years
+    - Years for Tesla Model S: /brands/Tesla/years?model_name=Model S
+    """
+    
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            years_set = set()
+            
+            if model_name:
+                # Get years for specific model
+                url = f"https://vpic.nhtsa.dot.gov/api/vehicles/GetVehicleTypesForMakeId/year/make/{brand_name}/model/{model_name}?format=json"
+            else:
+                # Get all years for brand
+                # Fetch recent years (2010-2025)
+                for year in range(2025, 2009, -1):
+                    url = f"https://vpic.nhtsa.dot.gov/api/vehicles/getmodelsformakeyear/make/{brand_name}/modelyear/{year}?format=json"
+                    response = await client.get(url)
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    if data.get("Results") and len(data["Results"]) > 0:
+                        years_set.add(year)
+            
+            # If model_name is provided, use a different approach
+            if model_name and not years_set:
+                # Alternative endpoint for specific model years
+                for year in range(2025, 2009, -1):
+                    url = f"https://vpic.nhtsa.dot.gov/api/vehicles/GetVehicleTypesForMakeId/year/make/{brand_name}/model/{model_name}/year/{year}?format=json"
+                    response = await client.get(url)
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    if data.get("Results") and len(data["Results"]) > 0:
+                        years_set.add(year)
+            
+            years_list = sorted(list(years_set), reverse=True)
+            
+            return {
+                "brand": brand_name,
+                "model": model_name if model_name else "All models",
+                "available_years": years_list,
+                "total_years": len(years_list)
+            }
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to fetch years: {str(e)}")
+
+
+@router.get("/brands/{brand_name}/vehicles")
+async def get_vehicles_by_brand(
+    brand_name: str,
+    year: Optional[int] = Query(None, description="Filter by year"),
+    model: Optional[str] = Query(None, description="Filter by model name"),
+    include_fields: Optional[str] = Query(None, description="Comma-separated fields to include: brand, model, year, vehicle_type, body_class, manufacturer, full_name"),
+    exclude_fields: Optional[str] = Query(None, description="Comma-separated fields to exclude"),
+    limit: int = Query(50, description="Number of vehicles to return", ge=1, le=100)
+):
+    """
+    Get detailed vehicle information by brand with filters
+    Returns complete vehicle details similar to VIN lookup
+    
+    Examples:
+    - All Tesla vehicles: /vehicles/brands/Tesla/vehicles
+    - Tesla vehicles from 2022: /vehicles/brands/Tesla/vehicles?year=2022
+    - Tesla Model S: /vehicles/brands/Tesla/vehicles?model=Model S
+    - Tesla Model S 2022: /vehicles/brands/Tesla/vehicles?model=Model S&year=2022
+    - Only brand and model: /vehicles/brands/Tesla/vehicles?include_fields=brand,model
+    """
+    
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            vehicles = []
+            
+            # First, get all models for the brand
+            if year:
+                url = f"https://vpic.nhtsa.dot.gov/api/vehicles/getmodelsformakeyear/make/{brand_name}/modelyear/{year}?format=json"
+            else:
+                url = f"https://vpic.nhtsa.dot.gov/api/vehicles/getmodelsformake/{brand_name}?format=json"
+            
+            response = await client.get(url)
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get("Results"):
+                for item in data["Results"]:
+                    model_name = item.get("Model_Name", "")
+                    
+                    # Apply model filter
+                    if model and model.lower() not in model_name.lower():
+                        continue
+                    
+                    # Fetch detailed vehicle information
+                    detail_url = f"https://vpic.nhtsa.dot.gov/api/vehicles/GetVehicleTypesForMakeId/make/{brand_name}/model/{model_name}?format=json"
+                    
+                    try:
+                        detail_response = await client.get(detail_url)
+                        detail_response.raise_for_status()
+                        detail_data = detail_response.json()
+                        
+                        vehicle_type = "N/A"
+                        body_class = "N/A"
+                        
+                        if detail_data.get("Results") and len(detail_data["Results"]) > 0:
+                            vehicle_type = detail_data["Results"][0].get("VehicleTypeName", "N/A")
+                            body_class = detail_data["Results"][0].get("BodyClass", "N/A")
+                        
+                        # Build complete vehicle details
+                        vehicle_info = {
+                            "brand": brand_name.upper(),
+                            "model": model_name,
+                            "year": str(year) if year else "N/A",
+                            "color": None,  # Color not available from API
+                            "vehicle_type": vehicle_type.lower() if vehicle_type != "N/A" else "car",
+                            "body_class": body_class if body_class != "N/A" else None,
+                            "manufacturer": brand_name.upper(),
+                            "full_name": f"{year} {brand_name.upper()} {model_name}" if year else f"{brand_name.upper()} {model_name}",
+                            "message": "Color information is not available from this API. Please add manually."
+                        }
+                        
+                        vehicles.append(vehicle_info)
+                        
+                    except Exception as e:
+                        # If detail fetch fails, still add basic info
+                        vehicle_info = {
+                            "brand": brand_name.upper(),
+                            "model": model_name,
+                            "year": str(year) if year else "N/A",
+                            "color": None,
+                            "vehicle_type": "car",
+                            "body_class": None,
+                            "manufacturer": brand_name.upper(),
+                            "full_name": f"{year} {brand_name.upper()} {model_name}" if year else f"{brand_name.upper()} {model_name}",
+                            "message": "Limited information available"
+                        }
+                        vehicles.append(vehicle_info)
+                    
+                    if len(vehicles) >= limit:
+                        break
+            
+            # Apply field filtering to each vehicle
+            filtered_vehicles = []
+            for vehicle in vehicles:
+                if include_fields:
+                    field_list = [f.strip() for f in include_fields.split(",")]
+                    filtered_vehicle = {k: v for k, v in vehicle.items() if k in field_list}
+                    filtered_vehicles.append(filtered_vehicle)
+                elif exclude_fields:
+                    exclude_list = [f.strip() for f in exclude_fields.split(",")]
+                    filtered_vehicle = {k: v for k, v in vehicle.items() if k not in exclude_list}
+                    filtered_vehicles.append(filtered_vehicle)
+                else:
+                    filtered_vehicles.append(vehicle)
+            
+            return {
+                "brand": brand_name.upper(),
+                "filters_applied": {
+                    "year": year,
+                    "model": model,
+                    "include_fields": include_fields,
+                    "exclude_fields": exclude_fields
+                },
+                "total_vehicles": len(filtered_vehicles),
+                "vehicles": filtered_vehicles
+            }
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to fetch vehicles: {str(e)}")
 
 @router.patch("/{vin}/update-color")
 async def update_vehicle_color(
